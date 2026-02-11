@@ -134,6 +134,8 @@
             const [showMicSetup, setShowMicSetup] = useState(false);
             const [showListeningGuide, setShowListeningGuide] = useState(false);
             const [congestionDetected, setCongestionDetected] = useState(false);
+            const [microphones, setMicrophones] = useState([]);
+            const [selectedMicId, setSelectedMicId] = useState('');
 
             // Refs
             const audioContextRef = useRef(null);
@@ -149,9 +151,24 @@
             const baselineEnergyRef = useRef(20);
             const noiseFloorRef = useRef(5);
             const energyHistoryRef = useRef([]);
+            const streamRef = useRef(null);
+            const peakBRRef = useRef(0);
+            const startingBRRef = useRef(null);
+            const elapsedTimeRef = useRef(0);
+            const breathHoldsRef = useRef([]);
 
             // Constants
             const emaAlpha = 0.25;
+
+            const getSupportedMimeType = () => {
+                const preferred = [
+                    'audio/webm;codecs=opus',
+                    'audio/mp4;codecs=mp4a.40.2',
+                    'audio/webm',
+                    'audio/mp4'
+                ];
+                return preferred.find(type => MediaRecorder.isTypeSupported(type)) || '';
+            };
 
             // Singing bowl sound (recovery chime)
             const playSingingBowl = () => {
@@ -174,6 +191,46 @@
                 oscillator.start(audioContext.currentTime);
                 oscillator.stop(audioContext.currentTime + duration);
             };
+
+
+            // Keep refs in sync for accurate detection
+            useEffect(() => {
+                peakBRRef.current = peakBR;
+            }, [peakBR]);
+
+            useEffect(() => {
+                startingBRRef.current = startingBR;
+            }, [startingBR]);
+
+            useEffect(() => {
+                elapsedTimeRef.current = elapsedTime;
+            }, [elapsedTime]);
+
+            useEffect(() => {
+                breathHoldsRef.current = breathHolds;
+            }, [breathHolds]);
+
+            // Populate microphones for explicit device selection
+            useEffect(() => {
+                const enumerate = async () => {
+                    if (!navigator.mediaDevices?.enumerateDevices) return;
+                    try {
+                        const devices = await navigator.mediaDevices.enumerateDevices();
+                        const inputs = devices.filter(d => d.kind === 'audioinput');
+                        setMicrophones(inputs);
+                        if (!selectedMicId && inputs.length) {
+                            const rode = inputs.find(d => /rode|wireless/i.test(d.label || ''));
+                            setSelectedMicId((rode && rode.deviceId) || inputs[0].deviceId || '');
+                        }
+                    } catch (err) {
+                        console.warn('Microphone enumeration failed', err);
+                    }
+                };
+
+                enumerate();
+                navigator.mediaDevices?.addEventListener?.('devicechange', enumerate);
+                return () => navigator.mediaDevices?.removeEventListener?.('devicechange', enumerate);
+            }, [selectedMicId]);
 
             // Timer effect
             useEffect(() => {
@@ -225,21 +282,28 @@
                     
                     const stream = await navigator.mediaDevices.getUserMedia({
                         audio: {
-                            echoCancellation: true,
-                            noiseSuppression: true,
-                            autoGainControl: true
+                            deviceId: selectedMicId ? { exact: selectedMicId } : undefined,
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: false,
+                            sampleRate: 48000,
+                            sampleSize: 16,
+                            channelCount: 1,
+                            latency: 0
                         }
                     });
+                    streamRef.current = stream;
                     
-                    audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
                     const source = audioContextRef.current.createMediaStreamSource(stream);
                     analyserRef.current = audioContextRef.current.createAnalyser();
                     analyserRef.current.fftSize = 4096;
                     analyserRef.current.smoothingTimeConstant = 0.1;
                     source.connect(analyserRef.current);
                     
+                    const mimeType = getSupportedMimeType();
                     mediaRecorderRef.current = new MediaRecorder(stream, { 
-                        mimeType: 'audio/webm',
+                        ...(mimeType ? { mimeType } : {}),
                         audioBitsPerSecond: 128000
                     });
                     audioChunksRef.current = [];
@@ -249,7 +313,7 @@
                     };
                     
                     mediaRecorderRef.current.onstop = () => {
-                        const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+                        const blob = new Blob(audioChunksRef.current, { type: getSupportedMimeType() || 'audio/webm' });
                         setAudioRecording(blob);
                         const url = URL.createObjectURL(blob);
                         setAudioPlaybackUrl(url);
@@ -430,35 +494,29 @@
                             breathTimestampsRef.current.push(currentTime);
                             lastBreathTimeRef.current = currentTime;
                             
-                            // Calculate average BR from recent breaths
-                            if (breathTimestampsRef.current.length >= 3) {
-                                const recentBreaths = breathTimestampsRef.current.slice(-6);
-                                const intervals = [];
-                                for (let i = 1; i < recentBreaths.length; i++) {
-                                    intervals.push(recentBreaths[i] - recentBreaths[i-1]);
+                            // Calculate rolling 60s BR (raw breaths per minute, no smoothing)
+                            const nowMs = Date.now();
+                            const rollingWindowMs = 60000;
+                            breathTimestampsRef.current = breathTimestampsRef.current.filter(ts => (nowMs - ts) <= rollingWindowMs);
+                            const rollingBR = Math.round((breathTimestampsRef.current.length / rollingWindowMs) * 60000);
+                            if (rollingBR >= 0 && rollingBR <= 120) {
+                                setRawBR(rollingBR);
+
+                                // Set starting BR from first valid window
+                                if (startingBRRef.current === null && breathTimestampsRef.current.length >= 3) {
+                                    setStartingBR(rollingBR);
                                 }
-                                const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-                                const avgBR = Math.round(60000 / avgInterval);
-                                
-                                if (avgBR >= 15 && avgBR <= 80) {
-                                    setRawBR(avgBR);
-                                    
-                                    // Set starting BR (first 3 breaths average)
-                                    if (startingBR === null && breathTimestampsRef.current.length >= 3) {
-                                        setStartingBR(avgBR);
-                                    }
-                                    
-                                    // Track peak BR
-                                    if (avgBR > peakBR) {
-                                        setPeakBR(avgBR);
-                                    }
+
+                                // Track peak BR reliably from latest ref
+                                if (rollingBR > peakBRRef.current) {
+                                    setPeakBR(rollingBR);
                                 }
                             }
                             
                             // BREATHING EXPRESSIONS DETECTION
                             // Power breath: Peak > 2x threshold
                             if (peak > adaptiveThreshold * 2) {
-                                const timestamp = Math.floor(elapsedTime);
+                                const timestamp = Math.floor(elapsedTimeRef.current);
                                 setPowerBreaths(prev => [...prev, timestamp]);
                                 console.log(`💨 POWER BREATH detected at ${timestamp}s - BR: ${currentBR} BPM`);
                             }
@@ -469,9 +527,9 @@
                 // BREATH HOLD DETECTION (interval > 4 seconds)
                 if (timeSinceLastBreath > 4000 && breathTimestampsRef.current.length > 0) {
                     const holdDuration = Math.floor(timeSinceLastBreath / 1000);
-                    const timestamp = Math.floor(elapsedTime);
+                    const timestamp = Math.floor(elapsedTimeRef.current);
                     
-                    if (!breathHolds.some(h => Math.abs(h.timestamp - timestamp) < 3)) {
+                    if (!breathHoldsRef.current.some(h => Math.abs(h.timestamp - timestamp) < 3)) {
                         setBreathHolds(prev => [...prev, { timestamp, duration: holdDuration }]);
                         console.log(`🫁 BREATH HOLD detected: ${holdDuration}s at ${timestamp}s`);
                     }
@@ -493,6 +551,11 @@
                     
                     if (audioContextRef.current) {
                         audioContextRef.current.close();
+                    }
+
+                    if (streamRef.current) {
+                        streamRef.current.getTracks().forEach(track => track.stop());
+                        streamRef.current = null;
                     }
                     
                     // Move to recovery
@@ -747,6 +810,24 @@
                                     <div className="font-bold text-gray-900">RCP</div>
                                     <div className="text-xs text-gray-600">&gt;55 BPM / RPE 9-10</div>
                                 </div>
+                            </div>
+
+                            {/* MICROPHONE SELECTOR */}
+                            <div className="bg-white rounded-2xl p-4 card-shadow border border-gray-100">
+                                <label className="block text-sm font-semibold text-gray-900 mb-2">Active microphone</label>
+                                <select
+                                    value={selectedMicId}
+                                    onChange={(e) => setSelectedMicId(e.target.value)}
+                                    className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm"
+                                >
+                                    {microphones.length === 0 && <option value="">Default microphone</option>}
+                                    {microphones.map((mic, index) => (
+                                        <option key={mic.deviceId || index} value={mic.deviceId}>
+                                            {mic.label || `Microphone ${index + 1}`}
+                                        </option>
+                                    ))}
+                                </select>
+                                <p className="text-xs text-gray-500 mt-2">Select Rode Wireless Mic explicitly for highest fidelity capture.</p>
                             </div>
 
                             {/* START BUTTON */}
@@ -1058,7 +1139,7 @@
                                     </div>
                                     
                                     <audio controls className="w-full mb-4">
-                                        <source src={audioPlaybackUrl} type="audio/webm" />
+                                        <source src={audioPlaybackUrl} />
                                     </audio>
                                     
                                     {showListeningGuide && (
